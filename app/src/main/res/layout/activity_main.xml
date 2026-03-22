@@ -157,7 +157,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="24dp"
             android:layout_marginBottom="16dp"
-            android:text="Notes: the app records locally first. When you tap Stop, Android asks where to export the finished CSV. You can choose local storage or Google Drive."
+            android:text="Notes: recording now runs in a foreground service so it can continue with the screen off. When you tap Stop, Android asks where to export the finished CSV."
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
