@@ -5,16 +5,20 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.textfield.TextInputEditText
 import java.io.BufferedWriter
 import java.io.File
-import java.io.FileWriter
+import java.io.IOException
+import java.io.OutputStream
+import java.io.OutputStreamWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -47,9 +51,34 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var accelCount: Long = 0
     private var gyroCount: Long = 0
     private var lastUiUpdateRealtimeMs: Long = 0L
-    private var currentFile: File? = null
+    private var currentOutputLabel: String = "No recording yet"
+    private var currentRecordingFile: File? = null
+    private var pendingExportSourceFile: File? = null
     private val currentAccuracy = mutableMapOf<Int, Int>()
     private val csvRecorder = CsvRecorder()
+
+    private val createDocumentLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+            val sourceFile = pendingExportSourceFile
+            pendingExportSourceFile = null
+
+            if (sourceFile == null) {
+                return@registerForActivityResult
+            }
+
+            if (uri == null) {
+                currentOutputLabel = sourceFile.absolutePath
+                filePathText.text = currentOutputLabel
+                Toast.makeText(
+                    this,
+                    "Save cancelled. Recording kept locally at ${sourceFile.absolutePath}",
+                    Toast.LENGTH_LONG
+                ).show()
+                return@registerForActivityResult
+            }
+
+            exportRecordingToDestination(sourceFile, uri)
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,21 +98,22 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         stopButton = findViewById(R.id.stopButton)
 
         startButton.setOnClickListener { startRecording() }
-        stopButton.setOnClickListener { stopRecording() }
+        stopButton.setOnClickListener { stopRecording(promptForSave = true) }
 
         updateSensorHelperText()
+        filePathText.text = currentOutputLabel
         showIdleStatus()
     }
 
     override fun onPause() {
         super.onPause()
         if (isRecording) {
-            stopRecording()
+            stopRecording(promptForSave = false)
         }
     }
 
     override fun onDestroy() {
-        stopRecording()
+        stopRecording(promptForSave = false)
         super.onDestroy()
     }
 
@@ -140,16 +170,34 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val parsedAccelHz = parsePositiveHz(accelRateEdit.text?.toString(), "accelerometer") ?: return
         val parsedGyroHz = parsePositiveHz(gyroRateEdit.text?.toString(), "gyroscope") ?: return
 
+        val outputFile = createOutputFile() ?: run {
+            Toast.makeText(this, "Could not create output file.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        beginRecording(parsedAccelHz, parsedGyroHz, accel, gyro, outputFile)
+    }
+
+    private fun beginRecording(
+        parsedAccelHz: Double,
+        parsedGyroHz: Double,
+        accel: Sensor,
+        gyro: Sensor,
+        outputFile: File
+    ) {
+        val outputStream = try {
+            outputFile.outputStream()
+        } catch (e: IOException) {
+            Toast.makeText(this, "Could not open output file: ${e.message}", Toast.LENGTH_LONG).show()
+            return
+        }
+
         accelRequestedHz = parsedAccelHz
         gyroRequestedHz = parsedGyroHz
         accelRequestedUs = hzToSamplingPeriodUs(parsedAccelHz)
         gyroRequestedUs = hzToSamplingPeriodUs(parsedGyroHz)
-
-        currentFile = createOutputFile()
-        val file = currentFile ?: run {
-            Toast.makeText(this, "Could not create output file.", Toast.LENGTH_LONG).show()
-            return
-        }
+        currentRecordingFile = outputFile
+        currentOutputLabel = outputFile.absolutePath
 
         sessionStartWallMs = System.currentTimeMillis()
         sessionStartElapsedNs = SystemClock.elapsedRealtimeNanos()
@@ -157,7 +205,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         gyroCount = 0
         lastUiUpdateRealtimeMs = 0L
 
-        csvRecorder.start(file)
+        csvRecorder.start(outputStream)
         csvRecorder.enqueue(
             "sensor_timestamp_ns,estimated_epoch_ms,sensor_type,sensor_name,requested_rate_hz,requested_period_us,x,y,z,accuracy"
         )
@@ -176,11 +224,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         stopButton.isEnabled = true
         accelRateEdit.isEnabled = false
         gyroRateEdit.isEnabled = false
-        filePathText.text = file.absolutePath
+        filePathText.text = currentOutputLabel
         maybeRefreshStatusUi(force = true)
     }
 
-    private fun stopRecording() {
+    private fun stopRecording(promptForSave: Boolean) {
         if (!isRecording && !csvRecorder.isRunning()) return
 
         sensorManager.unregisterListener(this)
@@ -191,16 +239,49 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         accelRateEdit.isEnabled = true
         gyroRateEdit.isEnabled = true
         showIdleStatus()
+
+        val recordedFile = currentRecordingFile
+        if (recordedFile == null || !recordedFile.exists()) {
+            filePathText.text = currentOutputLabel
+            return
+        }
+
+        currentOutputLabel = recordedFile.absolutePath
+        filePathText.text = currentOutputLabel
+
+        if (promptForSave) {
+            pendingExportSourceFile = recordedFile
+            createDocumentLauncher.launch(recordedFile.name)
+        }
+    }
+
+    private fun exportRecordingToDestination(sourceFile: File, destinationUri: Uri) {
+        try {
+            sourceFile.inputStream().use { input ->
+                val output = contentResolver.openOutputStream(destinationUri, "w")
+                    ?: throw IOException("Could not open selected destination.")
+                output.use {
+                    input.copyTo(it)
+                }
+            }
+            currentOutputLabel = destinationUri.toString()
+            filePathText.text = currentOutputLabel
+            Toast.makeText(this, "Recording exported.", Toast.LENGTH_SHORT).show()
+        } catch (e: IOException) {
+            currentOutputLabel = sourceFile.absolutePath
+            filePathText.text = currentOutputLabel
+            Toast.makeText(this, "Export failed. Local copy kept at ${sourceFile.absolutePath}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun showIdleStatus() {
-        val accelInfo = accelerometer?.let { "${it.name} (minDelay=${it.minDelay} µs)" } ?: "missing"
-        val gyroInfo = gyroscope?.let { "${it.name} (minDelay=${it.minDelay} µs)" } ?: "missing"
+        val accelInfo = accelerometer?.let { "${it.name} (minDelay=${it.minDelay} us)" } ?: "missing"
+        val gyroInfo = gyroscope?.let { "${it.name} (minDelay=${it.minDelay} us)" } ?: "missing"
         statusText.text = buildString {
             appendLine("Idle")
             appendLine("Accelerometer: $accelInfo")
             appendLine("Gyroscope: $gyroInfo")
-            append("Last counts — accel: $accelCount, gyro: $gyroCount")
+            append("Last counts - accel: $accelCount, gyro: $gyroCount")
         }
     }
 
@@ -211,20 +292,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         statusText.text = buildString {
             appendLine(if (isRecording) "Recording" else "Idle")
-            appendLine("Requested accel: ${formatHz(accelRequestedHz)} Hz (${accelRequestedUs} µs)")
-            appendLine("Requested gyro: ${formatHz(gyroRequestedHz)} Hz (${gyroRequestedUs} µs)")
-            appendLine("Samples so far — accel: $accelCount, gyro: $gyroCount")
+            appendLine("Requested accel: ${formatHz(accelRequestedHz)} Hz (${accelRequestedUs} us)")
+            appendLine("Requested gyro: ${formatHz(gyroRequestedHz)} Hz (${gyroRequestedUs} us)")
+            appendLine("Samples so far - accel: $accelCount, gyro: $gyroCount")
             append("CSV queue depth: ${csvRecorder.queueSize()}")
         }
     }
 
     private fun updateSensorHelperText() {
         accelHelperText.text = accelerometer?.let {
-            "Sensor: ${it.name} • minDelay=${it.minDelay} µs • fastest theoretical rate ≈ ${periodUsToHzText(it.minDelay)}"
+            "Sensor: ${it.name} - minDelay=${it.minDelay} us - fastest theoretical rate about ${periodUsToHzText(it.minDelay)}"
         } ?: "Accelerometer not available"
 
         gyroHelperText.text = gyroscope?.let {
-            "Sensor: ${it.name} • minDelay=${it.minDelay} µs • fastest theoretical rate ≈ ${periodUsToHzText(it.minDelay)}"
+            "Sensor: ${it.name} - minDelay=${it.minDelay} us - fastest theoretical rate about ${periodUsToHzText(it.minDelay)}"
         } ?: "Gyroscope not available"
     }
 
@@ -242,8 +323,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (!recordingsDir.exists() && !recordingsDir.mkdirs()) {
             return null
         }
+        return File(recordingsDir, buildSuggestedFileName())
+    }
+
+    private fun buildSuggestedFileName(): String {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        return File(recordingsDir, "imu_recording_$stamp.csv")
+        return "imu_recording_$stamp.csv"
     }
 
     private fun hzToSamplingPeriodUs(hz: Double): Int {
@@ -269,13 +354,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         private val stopToken = "__CSV_STOP__"
         private val queue = LinkedBlockingQueue<String>()
         private var writerThread: Thread? = null
-        @Volatile private var running = false
-        @Volatile private var writer: BufferedWriter? = null
 
-        fun start(file: File) {
+        @Volatile
+        private var running = false
+
+        @Volatile
+        private var writer: BufferedWriter? = null
+
+        fun start(outputStream: OutputStream) {
             stop()
             queue.clear()
-            writer = BufferedWriter(FileWriter(file, false))
+            writer = BufferedWriter(OutputStreamWriter(outputStream, Charsets.UTF_8))
             running = true
             writerThread = thread(start = true, name = "csv-writer") {
                 try {
@@ -311,6 +400,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
 
         fun queueSize(): Int = queue.size.coerceAtLeast(0)
+
         fun isRunning(): Boolean = running || writerThread != null
     }
 }
